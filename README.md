@@ -2,7 +2,7 @@
 
 This project automates the process of updating NISAR (NIAID Information Systems Architecture Repository) with data from Jira issues. It fetches CAB (Change Advisory Board) requests from a Jira filter, parses the structured CAB description fields, and fills out the NISAR web form using browser automation.
 
-NISAR is hosted at https://nisar.niaid.nih.gov/CAB/ManageCabReq.aspx and requires access from the NIAID network or VPN.
+NISAR requires access from the NIAID network or VPN.
 
 ## Features
 
