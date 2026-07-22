@@ -1,3 +1,19 @@
+def update_jira_cab_id(config, issue_key, cab_id):
+    """
+    Updates the Jira issue's customfield_10917 (CAB ID) with the given cab_id value.
+    """
+    url = f"{config['jira_url'].rstrip('/')}/rest/api/2/issue/{issue_key}"
+    headers = {
+        'Authorization': f"Bearer {config['jira_pat']}",
+        'Content-Type': 'application/json'
+    }
+    data = {"fields": {"customfield_10917": cab_id}}
+    resp = requests.put(url, headers=headers, data=json.dumps(data))
+    if resp.status_code == 204:
+        print(f"[JIRA] Updated CAB ID ({cab_id}) for {issue_key}.")
+    else:
+        print(f"[JIRA][ERROR] Failed to update CAB ID for {issue_key}: {resp.status_code} - {resp.text}")
+
 import certifi
 import ssl
 import os
@@ -356,6 +372,7 @@ def parse_cab_description(cab_text):
         "Deployment To": r"Deployment Date:[^\n]*\n[\s\S]*?•?\s*To[:：]?\s*([\d/\-]+)",
         "Roleback": r"Rollback Plan[:：]?\s*([\s\S]*?)(?=Communication to End Users:|Communication:|$)",
         "Communications": r"Communication to End Users[:：]?\s*([\s\S]*?)(?=CAB Presenter:|$)",
+        "CAB Presenter": r"CAB Presenter[:：]?\s*(.*)",
     }
 
     for key, pattern in patterns.items():
@@ -373,9 +390,29 @@ def parse_cab_description(cab_text):
 import json
 import requests
 
+
+def _resolve_jira_pat(config):
+    """
+    Resolve Jira PAT from environment first, then config as temporary fallback.
+    """
+    env_pat = os.getenv("JIRA_PAT", "").strip()
+    if env_pat:
+        return env_pat
+
+    config_pat = str(config.get("jira_pat", "")).strip()
+    if config_pat:
+        print("[WARN] JIRA_PAT is not set in environment; falling back to config.json jira_pat.")
+        return config_pat
+
+    raise RuntimeError(
+        "Missing Jira PAT. Set environment variable JIRA_PAT or provide jira_pat in config.json."
+    )
+
 def load_config():
     with open('config.json', 'r') as f:
-        return json.load(f)
+        config = json.load(f)
+    config['jira_pat'] = _resolve_jira_pat(config)
+    return config
 
 def get_jira_issues(config):
     headers = {
@@ -469,7 +506,12 @@ def populate_nisar_form(url, field_values, driver_path="msedgedriver.exe", timeo
     # Step 1: Go to CAB home page
     cab_home = "https://nisar.niaid.nih.gov/CAB/ManageCabReq.aspx"
     print(f"[DEBUG] Navigating to CAB home: {cab_home}")
-    driver.get(cab_home)
+    try:
+        driver.get(cab_home)
+    except Exception as e:
+        if 'net::ERR_NAME_NOT_RESOLVED' in str(e):
+            print("[ERROR] Could not resolve the NISAR CAB URL. Please verify that you are connected to VPN if required to access internal resources.")
+        raise
     # Step 2: Click the button to open the form
     try:
         print("[DEBUG] Waiting for form launch button...")
@@ -521,51 +563,104 @@ def populate_nisar_form(url, field_values, driver_path="msedgedriver.exe", timeo
         if not xpath or value == '':
             print(f"[SKIPPED]   {xpath} (No value to populate)")
             continue
+        print(f"[DEBUG] Processing field xpath: {xpath}")
+        print(f"[DEBUG] Expected Change Item Search xpath: {XPATH_FIELDS.get('Change Item Search')}")
         try:
             elem = WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.XPATH, xpath)))
             tag = elem.tag_name.lower()
             if tag == "input":
                 input_type = elem.get_attribute("type")
-                if input_type in ["text", "password", "number", "email", "date"]:
+                print(f"[DEBUG] input_type for {xpath}: {input_type}")
+                # --- Handle checkboxes ---
+                if input_type == "checkbox":
+                    should_check = bool(value)
+                    try:
+                        if elem.is_selected() != should_check:
+                            elem.click()
+                    except Exception as e:
+                        if "invalid element state" in str(e):
+                            # Try clicking parent label
+                            try:
+                                label = elem.find_element(By.XPATH, "ancestor::label")
+                                label.click()
+                                print("[FALLBACK] Clicked parent label for checkbox.")
+                            except Exception:
+                                # Fallback to JS
+                                driver.execute_script("arguments[0].checked = arguments[1]; arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", elem, should_check)
+                                print("[FALLBACK] Set checkbox via JS.")
+                        else:
+                            raise
+                    if elem.is_selected() != should_check:
+                        driver.execute_script("arguments[0].checked = arguments[1]; arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", elem, should_check)
+                        print("[FALLBACK] Set checkbox via JS (post-check).")
+                # --- Handle radios ---
+                elif input_type == "radio":
+                    try:
+                        if value is True or value == "True":
+                            if not elem.is_selected():
+                                elem.click()
+                            if xpath == XPATH_FIELDS.get("Change Type System") and cr_id_prefix:
+                                try:
+                                    search_elem = WebDriverWait(driver, timeout).until(
+                                        EC.presence_of_element_located((By.XPATH, XPATH_FIELDS.get("Change Item Search")))
+                                    )
+                                    search_elem.clear()
+                                    search_elem.send_keys(cr_id_prefix)
+                                    print(f"[POPULATED] {XPATH_FIELDS.get('Change Item Search')} <= {cr_id_prefix} (after radio select)")
+                                except Exception as e:
+                                    print(f"[SKIPPED]   {XPATH_FIELDS.get('Change Item Search')} (after radio select, {e})")
+                        elif elem.get_attribute("value") == str(value):
+                            elem.click()
+                    except Exception as e:
+                        if "invalid element state" in str(e):
+                            # Try clicking parent label
+                            try:
+                                label = elem.find_element(By.XPATH, "ancestor::label")
+                                label.click()
+                                print("[FALLBACK] Clicked parent label for radio.")
+                            except Exception:
+                                # Fallback to JS
+                                driver.execute_script("arguments[0].checked = true; arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", elem)
+                                print("[FALLBACK] Set radio via JS.")
+                        else:
+                            raise
+                # --- Handle normal text inputs ---
+                else:
                     elem.clear()
                     elem.send_keys(str(value))
-                elif input_type == "checkbox":
-                    should_check = bool(value)
-                    # Always try to set the checkbox state
-                    if elem.is_selected() != should_check:
-                        elem.click()
-                    # Double-check and force with JS if needed
-                    if elem.is_selected() != should_check:
-                        driver.execute_script("arguments[0].checked = arguments[1];", elem, should_check)
-                elif input_type == "radio":
-                    # If value is True, always select this radio
-                    if value is True or value == "True":
-                        if not elem.is_selected():
-                            elem.click()
-                        # After selecting this radio, set Change Item Search to CR ID prefix
-                        if xpath == XPATH_FIELDS.get("Change Type System") and cr_id_prefix:
-                            try:
-                                search_elem = WebDriverWait(driver, timeout).until(
-                                    EC.presence_of_element_located((By.XPATH, XPATH_FIELDS.get("Change Item Search")))
-                                )
-                                search_elem.clear()
-                                search_elem.send_keys(cr_id_prefix)
-                                print(f"[POPULATED] {XPATH_FIELDS.get('Change Item Search')} <= {cr_id_prefix} (after radio select)")
-                            except Exception as e:
-                                print(f"[SKIPPED]   {XPATH_FIELDS.get('Change Item Search')} (after radio select, {e})")
-                    # Otherwise, match by value string as before
-                    elif elem.get_attribute("value") == str(value):
-                        elem.click()
+                    # Special case: if this is the Change Item Search input, try to auto-select the only dropdown option
+                    if xpath == XPATH_FIELDS.get("Change Item Search"):
+                        print("[DEBUG] Entered Change Item Search input, attempting dropdown auto-select...")
+                        try:
+                            from selenium.webdriver.support.ui import Select
+                            dropdown_xpath = "//select[@id='ctl00_ContentPlaceHolder1_drpSystem']"
+                            print(f"[DEBUG] Waiting for dropdown at {dropdown_xpath}")
+                            dropdown_elem = WebDriverWait(driver, timeout).until(
+                                EC.visibility_of_element_located((By.XPATH, dropdown_xpath))
+                            )
+                            print("[DEBUG] Dropdown element found, checking options...")
+                            select = Select(dropdown_elem)
+                            def only_one_visible_option(driver):
+                                options = [o for o in dropdown_elem.find_elements(By.TAG_NAME, "option") if o.is_displayed()]
+                                print(f"[DEBUG] Dropdown visible options count: {len(options)}")
+                                return len(options) == 1
+                            WebDriverWait(driver, timeout).until(only_one_visible_option)
+                            options = [o for o in dropdown_elem.find_elements(By.TAG_NAME, "option") if o.is_displayed()]
+                            if len(options) == 1:
+                                select.select_by_index(0)
+                                print("[AUTO-SELECT] Only one option in dropdown, auto-selected it.")
+                            else:
+                                print(f"[INFO] Dropdown has {len(options)} visible options, not auto-selecting.")
+                        except Exception as e:
+                            print(f"[AUTO-SELECT][ERROR] Could not auto-select dropdown: {e}")
             elif tag == "textarea":
                 elem.clear()
                 elem.send_keys(str(value))
             elif tag == "div":
-                # For content-editable divs
                 if elem.get_attribute("contenteditable") == "true":
                     elem.clear()
                     elem.send_keys(str(value))
                 else:
-                    # Try to set innerText for non-contenteditable divs
                     driver.execute_script("arguments[0].innerText = arguments[1];", elem, str(value))
             else:
                 print(f"[SKIPPED]   {xpath} (Unsupported tag: {tag})")
@@ -589,27 +684,36 @@ def populate_nisar_form(url, field_values, driver_path="msedgedriver.exe", timeo
             break
         else:
             print("[CLI] Invalid input. Please press Enter, 's', or 'q'.")
+
     # Wait for user to submit the form (detect by URL change or success element)
     print("[INFO] Waiting for form submission. The script will continue after you submit the form in the browser.")
     last_url = driver.current_url
+    cab_id = None
     try:
         while True:
             if driver.current_url != last_url:
                 print(f"[INFO] Detected navigation to {driver.current_url}")
+                # Try to extract CAB ID from redirected URL
+                import re
+                m = re.search(r"ViewCab\\.aspx\\?Id=(\\d+)", driver.current_url)
+                if m:
+                    cab_id = m.group(1)
+                    print(f"[INFO] CAB submitted. CAB ID: {cab_id}")
+                else:
+                    print(f"[WARN] Could not extract CAB ID from URL: {driver.current_url}")
                 break
             import time
             time.sleep(2)
     except KeyboardInterrupt:
         print("[INFO] Interrupted by user. Closing browser.")
         driver.quit()
-        return
+        return None
 
-    # Placeholder: Capture data from the successfully submitted page
-    print("[TODO] Capture data from the submitted page here.")
-    # Placeholder: Update Jira record
-    print("[TODO] Update Jira record here.")
     driver.quit()
-    return 'submitted'
+    if cab_id:
+        return cab_id
+    else:
+        return 'submitted'
 
 def main():
     """
@@ -623,15 +727,25 @@ def main():
     print(f"Found {len(filtered_issues)} issues (excluding 'Ready to Present').")
     import sys
     for idx, issue in enumerate(filtered_issues):
-        print(f"\nProcessing Jira issue {idx+1}/{len(filtered_issues)}: {issue['key']} - {issue['fields']['summary']}")
+        # --- CLI info message with project, fixVersion, CAB Presenter ---
+        project = issue['fields'].get('project', {}).get('name', '[Unknown Project]')
+        fix_versions = issue['fields'].get('fixVersions', [])
+        fix_version = fix_versions[0]['name'] if fix_versions else '[None]'
+        cab_desc_field = 'customfield_10916'
+        cab_desc = issue['fields'].get(cab_desc_field, '')
+        cab_data = parse_cab_description(cab_desc)
+        cab_presenter = cab_data.get('CAB Presenter', '[Not Found]')
+        print(f"\n--- Jira Issue Info ---\nProject: {project}\nFix Version: {fix_version}\nCAB Presenter: {cab_presenter}\n----------------------")
+        print(f"Processing Jira issue {idx+1}/{len(filtered_issues)}: {issue['key']} - {issue['fields']['summary']}")
         print_field_population_map(issue)
         field_values = get_field_population_values(issue)
         result = populate_nisar_form(nisar_url, field_values)
         if result == 'skipped':
             print(f"[INFO] Skipped issue {issue['key']}.")
             continue
-        elif result == 'submitted':
-            print(f"[INFO] Issue {issue['key']} processed.")
+        elif result and result != 'submitted':
+            print(f"[INFO] Issue {issue['key']} processed. CAB ID: {result}")
+            update_jira_cab_id(config, issue['key'], result)
         else:
             print(f"[WARN] Issue {issue['key']} may not have been processed.")
 
